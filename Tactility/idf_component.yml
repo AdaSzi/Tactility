@@ -83,8 +83,9 @@ dependencies:
   espressif/esp_lvgl_port: "2.7.2"
   lvgl/lvgl: "9.3.0"
   epdiy:
-    git: https://github.com/vroland/epdiy.git
-    version: 2.1.3
+    # Fork of epdiy 2.1.3 that adds the LILYGO T5 4.7 Inch E-Paper S3, disabled by default
+    git: https://github.com/AdaSzi/epdiy.git
+    version: 2.1.3-t5s3.1
     rules:
       # More hardware might be supported - enable as needed
       - if: "target in [esp32s3]"
