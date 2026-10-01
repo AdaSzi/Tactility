@@ -146,7 +146,9 @@ static bool should_use_quality_mode(T5s3DisplayInternal* internal, int32_t width
         static_cast<float>(internal->panel_pixel_count) * FULL_AREA_QUALITY_THRESHOLD
     );
     const bool partial_count_exceeded = internal->partial_count_since_quality >= QUALITY_REFRESH_PARTIAL_COUNT;
-    const bool within_hold = now < internal->quality_hold_until_tick;
+    // Signed difference stays correct across the tick counter wrap, 0 means no hold
+    const TickType_t hold_until = internal->quality_hold_until_tick;
+    const bool within_hold = hold_until != 0 && static_cast<int32_t>(hold_until - now) > 0;
     *out_within_hold = within_hold;
 
     return is_full_screen_change || partial_count_exceeded || within_hold;
@@ -165,6 +167,8 @@ static void commit_quality_mode_decision(T5s3DisplayInternal* internal, bool use
             const TickType_t session_elapsed = now - internal->quality_hold_session_start_tick;
             if (session_elapsed < millis_to_ticks(QUALITY_HOLD_SESSION_MAX_MS)) {
                 internal->quality_hold_until_tick = now + millis_to_ticks(QUALITY_HOLD_MS);
+            } else {
+                internal->quality_hold_until_tick = 0;
             }
         }
     } else {
