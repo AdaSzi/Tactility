@@ -2,16 +2,12 @@
 
 #include <stdint.h>
 
-#include <epdiy.h>
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 struct T5s3DisplayConfig {
-    int temperature_celsius;
-    enum EpdDrawMode quality_draw_mode;
-    enum EpdRotation rotation;
+    uint32_t pixel_clock_hz;
 };
 
 #ifdef __cplusplus

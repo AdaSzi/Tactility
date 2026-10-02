@@ -1,25 +1,11 @@
 description: >
-  LILYGO T5-4.7" E-Paper S3 (V2.3/V2.4) display (EPDiy library, ED047TC1 panel). The panel is driven
-  through a fixed parallel bus and a 74HCT4094 shift register that epdiy's
-  epd_board_lilygo_t5_47_s3 hardcodes, so this node takes no pin properties of its own.
-  The shift register also carries the supply of the GT911 touch controller, so this node must
-  be listed before the I2C bus in the devicetree.
+  LILYGO T5 4.7 Inch E-Paper S3 (V2.3/V2.4) display with an ED047TC1 panel. The pins of the panel
+  are fixed in the driver, so this node only has the pixel clock as property.
 
 compatible: "lilygo,t5s3-display"
 
 properties:
-  temperature-celsius:
+  pixel-clock-hz:
     type: int
-    default: 20
-    description: Ambient temperature in °C, used for waveform timing compensation
-  quality-draw-mode:
-    type: int
-    default: MODE_GC16
-    description: >
-      EpdDrawMode waveform used for full-quality refreshes (e.g. MODE_GC16, MODE_GL16).
-      Fast partial updates always use MODE_DU internally and are not configurable - see
-      driver comments.
-  rotation:
-    type: int
-    default: EPD_ROT_LANDSCAPE
-    description: Fixed EpdRotation applied at start - not changeable at runtime. The touch axis flags must match it.
+    default: 10000000
+    description: Clock of the bus that sends the pixel data of a row. Faster speeds up updates if the panel accepts it.
