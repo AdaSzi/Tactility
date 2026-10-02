@@ -59,7 +59,7 @@ static constexpr int CLEAR_REST_FRAMES = 2;
 static constexpr uint8_t ALL_DARK = 0x55;
 static constexpr uint8_t ALL_LIGHT = 0xAA;
 
-// Limit for waiting on a peripheral, so that a lost interrupt cannot hang the system
+// Limit for waiting on a flag that an interrupt handler sets, so that a lost interrupt fails the update instead of spinning forever
 static constexpr uint32_t WAIT_SPIN_LIMIT = 20000000;
 
 struct Engine {
@@ -106,10 +106,11 @@ static bool IRAM_ATTR on_transfer_done(esp_lcd_panel_io_handle_t, esp_lcd_panel_
     return false;
 }
 
+// After a failure nothing is waited for anymore, so the rest of the update ends quickly
 static void IRAM_ATTR wait_for(volatile bool& flag) {
     uint32_t spins = 0;
     while (!flag) {
-        if (++spins > WAIT_SPIN_LIMIT) {
+        if (engine.failed || ++spins > WAIT_SPIN_LIMIT) {
             engine.failed = true;
             flag = true;
         }
@@ -260,7 +261,7 @@ static void IRAM_ATTR draw_frame(const uint8_t* table, uint32_t hold_ticks) {
     start_frame();
     int y = 0;
     bool ends_with_train = false;
-    while (y < T5S3_EPD_HEIGHT) {
+    while (y < T5S3_EPD_HEIGHT && !engine.failed) {
         ends_with_train = false;
         if (engine.row_dirty[y]) {
             t5s3_epd_prepare_row(
@@ -286,7 +287,7 @@ static void IRAM_ATTR draw_frame(const uint8_t* table, uint32_t hold_ticks) {
         }
     }
     // The last row is applied by one more pulse
-    if (engine.rows_skipped == 0) {
+    if (engine.rows_skipped == 0 && !engine.failed) {
         write_row(hold_ticks);
     } else if (ends_with_train) {
         // The end of the frame must not overlap the train of pulses of the skipped rows
@@ -299,10 +300,12 @@ static void IRAM_ATTR draw_uniform_frame(uint8_t pattern, uint32_t hold_ticks) {
     memset(engine.row_buffer[0], pattern, T5S3_EPD_BUS_ROW_BYTES);
     memset(engine.row_buffer[1], pattern, T5S3_EPD_BUS_ROW_BYTES);
     start_frame();
-    for (int y = 0; y < T5S3_EPD_HEIGHT; y++) {
+    for (int y = 0; y < T5S3_EPD_HEIGHT && !engine.failed; y++) {
         write_row(hold_ticks);
     }
-    write_row(hold_ticks);
+    if (!engine.failed) {
+        write_row(hold_ticks);
+    }
     end_frame();
 }
 
@@ -528,17 +531,23 @@ bool t5s3_epd_update(T5s3EpdMode mode, int32_t y_start, int32_t y_end) {
     uint8_t table[256];
     if (mode == T5s3EpdMode::Fast) {
         t5s3_epd_build_fast_table(table);
-        for (uint32_t phase = 0; phase < FAST_PHASES; phase++) {
+        for (uint32_t phase = 0; phase < FAST_PHASES && !engine.failed; phase++) {
             draw_frame(table, FAST_HOLD_TICKS);
             taskYIELD();
         }
     } else {
         // Long updates sleep between frames so that the idle task can feed the watchdog
-        for (int phase = 0; phase < T5S3_EPD_QUALITY_PHASES; phase++) {
+        for (int phase = 0; phase < T5S3_EPD_QUALITY_PHASES && !engine.failed; phase++) {
             t5s3_epd_build_quality_table(table, phase, mode == T5s3EpdMode::Full);
             draw_frame(table, T5S3_EPD_QUALITY_HOLD[phase]);
             vTaskDelay(1);
         }
+    }
+
+    // A failed update leaves the back buffer alone, so the next update draws the same rows again
+    if (engine.failed) {
+        LOG_E(TAG, "Update failed, a peripheral did not respond");
+        return false;
     }
 
     for (int y = y_start; y < y_end; y++) {
@@ -547,10 +556,6 @@ bool t5s3_epd_update(T5s3EpdMode mode, int32_t y_start, int32_t y_end) {
         }
     }
 
-    if (engine.failed) {
-        LOG_E(TAG, "Update failed, a peripheral did not respond");
-        return false;
-    }
     const int elapsed_ms = static_cast<int>((esp_timer_get_time() - started) / 1000);
     // Quality and slow updates are logged at info level, frequent fast updates would flood the log
     if (mode != T5s3EpdMode::Fast || elapsed_ms > 150) {
@@ -561,6 +566,13 @@ bool t5s3_epd_update(T5s3EpdMode mode, int32_t y_start, int32_t y_end) {
     return true;
 }
 
+static void draw_clear_frames(uint8_t pattern, int count) {
+    for (int i = 0; i < count && !engine.failed; i++) {
+        draw_uniform_frame(pattern, CLEAR_HOLD_TICKS);
+        vTaskDelay(1);
+    }
+}
+
 bool t5s3_epd_clear() {
     const int64_t started = esp_timer_get_time();
     t5s3_epd_fill_white();
@@ -569,21 +581,16 @@ bool t5s3_epd_clear() {
     }
     engine.failed = false;
     for (int cycle = 0; cycle < CLEAR_CYCLES; cycle++) {
-        for (int i = 0; i < CLEAR_DARK_FRAMES; i++) {
-            draw_uniform_frame(ALL_DARK, CLEAR_HOLD_TICKS);
-            vTaskDelay(1);
-        }
-        for (int i = 0; i < CLEAR_LIGHT_FRAMES; i++) {
-            draw_uniform_frame(ALL_LIGHT, CLEAR_HOLD_TICKS);
-            vTaskDelay(1);
-        }
-        for (int i = 0; i < CLEAR_REST_FRAMES; i++) {
-            draw_uniform_frame(0, CLEAR_HOLD_TICKS);
-            vTaskDelay(1);
-        }
+        draw_clear_frames(ALL_DARK, CLEAR_DARK_FRAMES);
+        draw_clear_frames(ALL_LIGHT, CLEAR_LIGHT_FRAMES);
+        draw_clear_frames(0, CLEAR_REST_FRAMES);
+    }
+    if (engine.failed) {
+        LOG_E(TAG, "Clear failed, a peripheral did not respond");
+        return false;
     }
     LOG_I(TAG, "Cleared in %d ms", static_cast<int>((esp_timer_get_time() - started) / 1000));
-    return !engine.failed;
+    return true;
 }
 
 // endregion
