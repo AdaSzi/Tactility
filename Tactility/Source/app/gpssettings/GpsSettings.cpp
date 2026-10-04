@@ -187,6 +187,11 @@ void createDeviceRow(Context* ctx, Device* device) {
 // Rebuilds the device list. Only needs to run when the set of devices could've changed (on
 // creation, and after returning from AddGps) - button state itself is refreshed by the timer.
 void rebuildDeviceList(Context* ctx) {
+    // While another window is on top the widgets don't exist, createWidgets() rebuilds the list later
+    if (ctx->deviceListWrapper == nullptr) {
+        return;
+    }
+
     lv_obj_clean(ctx->deviceListWrapper);
     ctx->deviceRows.clear();
 
@@ -226,6 +231,12 @@ void updateDeviceStates(Context* ctx) {
         }
     }
     lvgl_unlock();
+}
+
+void destroyWidgets(void* userData) {
+    auto* ctx = static_cast<Context*>(userData);
+    ctx->deviceListWrapper = nullptr;
+    ctx->deviceRows.clear();
 }
 
 void createWidgets(lv_obj_t* parent, void* userData) {
@@ -273,7 +284,7 @@ int32_t appMain(int argc, char* argv[]) {
     AppEventSubscription sub {};
     check(app_event_subscribe(&sub, &event_group) == ERROR_NONE);
 
-    WindowId window = window_manager_create(appInstanceId, createWidgets, &ctx);
+    WindowId window = window_manager_create_ext(appInstanceId, createWidgets, destroyWidgets, &ctx);
     ctx.timer->start();
 
     bool shouldClose = false;
