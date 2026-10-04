@@ -1,0 +1,178 @@
+/dts-v1/;
+
+#include <tactility/bindings/root.h>
+#include <tactility/bindings/esp32_ble.h>
+#include <tactility/bindings/esp32_gpio.h>
+#include <tactility/bindings/esp32_i2c_master.h>
+#include <tactility/bindings/esp32_sdmmc.h>
+#include <tactility/bindings/esp32_spi.h>
+#include <tactility/bindings/esp32_uart.h>
+#include <tactility/bindings/esp32_usbdevice.h>
+#include <tactility/bindings/esp32_wifi_pinned.h>
+#include <tactility/bindings/gpio_hog.h>
+#include <bindings/tca95xx.h>
+#include <bindings/gt911.h>
+#include <bindings/lp5814.h>
+#include <bindings/nv3031b.h>
+#include <gps_generic/bindings.h>
+
+// Reference: https://wiki.seeedstudio.com/meshtastic_wio_tracker_l2_intro/
+/ {
+	compatible = "root";
+	model = "Seeed Studio Wio Tracker L2 Pro";
+
+	wifi0 {
+		compatible = "espressif,esp32-wifi-pinned";
+	};
+
+	ble0 {
+		compatible = "espressif,esp32-ble";
+	};
+
+	gpio0 {
+		compatible = "espressif,esp32-gpio";
+		gpio-count = <49>;
+	};
+
+	i2c0 {
+		compatible = "espressif,esp32-i2c-master";
+		port = <I2C_NUM_0>;
+		clock-frequency = <100000>;
+		pin-sda = <&gpio0 47 GPIO_FLAG_NONE>;
+		pin-scl = <&gpio0 48 GPIO_FLAG_NONE>;
+
+		// PCA9555, register compatible with the TCA9535
+		pca9555 {
+			compatible = "ti,tca9535";
+			reg = <0x21>;
+
+			lcd_power {
+				compatible = "gpio-hog";
+				pin = <&pca9555 5 GPIO_FLAG_NONE>;
+				mode = <GPIO_HOG_MODE_OUTPUT_HIGH>;
+			};
+
+			grove_power {
+				compatible = "gpio-hog";
+				pin = <&pca9555 7 GPIO_FLAG_NONE>;
+				mode = <GPIO_HOG_MODE_OUTPUT_HIGH>;
+			};
+
+			// Active high
+			gnss_reset {
+				compatible = "gpio-hog";
+				pin = <&pca9555 9 GPIO_FLAG_NONE>;
+				mode = <GPIO_HOG_MODE_OUTPUT_LOW>;
+			};
+
+			user_led {
+				compatible = "gpio-hog";
+				pin = <&pca9555 10 GPIO_FLAG_NONE>;
+				mode = <GPIO_HOG_MODE_OUTPUT_LOW>;
+			};
+
+			usb_otg {
+				compatible = "gpio-hog";
+				pin = <&pca9555 11 GPIO_FLAG_NONE>;
+				mode = <GPIO_HOG_MODE_OUTPUT_LOW>;
+			};
+
+			speaker_amplifier {
+				compatible = "gpio-hog";
+				pin = <&pca9555 12 GPIO_FLAG_NONE>;
+				mode = <GPIO_HOG_MODE_OUTPUT_LOW>;
+			};
+
+			gnss_power {
+				compatible = "gpio-hog";
+				pin = <&pca9555 13 GPIO_FLAG_NONE>;
+				mode = <GPIO_HOG_MODE_OUTPUT_HIGH>;
+			};
+
+			sdcard_power {
+				compatible = "gpio-hog";
+				pin = <&pca9555 14 GPIO_FLAG_NONE>;
+				mode = <GPIO_HOG_MODE_OUTPUT_HIGH>;
+			};
+
+			battery_divider {
+				compatible = "gpio-hog";
+				pin = <&pca9555 15 GPIO_FLAG_NONE>;
+				mode = <GPIO_HOG_MODE_OUTPUT_HIGH>;
+			};
+		};
+
+		// Native orientation is portrait, the device is used in landscape
+		touch {
+			compatible = "goodix,gt911";
+			reg = <0x5D>;
+			x-max = <240>;
+			y-max = <320>;
+			swap-xy;
+			mirror-y;
+			pin-reset = <&pca9555 8 GPIO_FLAG_NONE>;
+			pin-interrupt = <&pca9555 3 GPIO_FLAG_NONE>;
+		};
+
+		// Started at boot after the display is drawn
+		display_backlight {
+			compatible = "ti,lp5814";
+			reg = <0x2C>;
+			status = "disabled";
+			high-current;
+			dot-current = <200>;
+		};
+	};
+
+	spi1 {
+		compatible = "espressif,esp32-spi";
+		host = <SPI3_HOST>;
+		cs-gpios = <&gpio0 46 GPIO_FLAG_NONE>;
+		pin-sclk = <&gpio0 42 GPIO_FLAG_NONE>;
+		pin-mosi = <&gpio0 41 GPIO_FLAG_NONE>;
+		pin-miso = <&gpio0 40 GPIO_FLAG_NONE>;
+		pin-wp = <&gpio0 39 GPIO_FLAG_NONE>;
+		pin-hd = <&gpio0 38 GPIO_FLAG_NONE>;
+
+		display@0 {
+			compatible = "newvision,nv3031b";
+			horizontal-resolution = <320>;
+			vertical-resolution = <240>;
+			swap-xy;
+			mirror-y;
+			pixel-clock-hz = <40000000>;
+			pin-reset = <&pca9555 6 GPIO_FLAG_NONE>;
+			backlight = <&display_backlight>;
+		};
+	};
+
+	sdmmc0 {
+		compatible = "espressif,esp32-sdmmc";
+		pin-clk = <&gpio0 2 GPIO_FLAG_NONE>;
+		pin-cmd = <&gpio0 3 GPIO_FLAG_NONE>;
+		pin-d0 = <&gpio0 1 GPIO_FLAG_NONE>;
+		slot = <SDMMC_HOST_SLOT_1>;
+		bus-width = <1>;
+	};
+
+	uart_gps {
+		compatible = "espressif,esp32-uart";
+		port = <UART_NUM_1>;
+		pin-tx = <&gpio0 17 GPIO_FLAG_NONE>;
+		pin-rx = <&gpio0 18 GPIO_FLAG_NONE>;
+
+		gps {
+			compatible = "tactility,gps-generic";
+			status = "disabled";
+			baud-rate = <9600>;
+		};
+	};
+
+	usbdevice0 {
+		compatible = "espressif,esp32-usbdevice";
+
+		usbdevicemsc0 {
+			compatible = "espressif,esp32-usbdevice-msc";
+		};
+	};
+};

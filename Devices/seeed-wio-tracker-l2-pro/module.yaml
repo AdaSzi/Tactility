@@ -1,0 +1,9 @@
+dependencies:
+  - Platforms/platform-esp32
+  - Drivers/tca95xx-16bit-module
+  - Drivers/gt911-module
+  - Drivers/lp5814-module
+  - Drivers/nv3031b-module
+  - Drivers/gps-generic-module
+dts: seeed,wio-tracker-l2-pro.dts
+dts-only: true
