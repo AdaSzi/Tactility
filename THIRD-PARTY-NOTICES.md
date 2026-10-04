@@ -10,7 +10,7 @@ License: [MIT License](https://github.com/valdanylchuk/breezybox/blob/main/LICEN
 
 ### epdiy
 
-The e-paper driver of the LILYGO T5 4.7 Inch E-Paper S3 (`Devices/lilygo-t5-epd47-s3`) is derived from epdiy and contains its ED047TC1 waveform data.
+The e-paper driver of the LILYGO T5 4.7 Inch E-Paper S3 (`Drivers/lilygo-t5s3-epd-module`) is derived from epdiy and contains its ED047TC1 waveform data.
 
 Website: https://github.com/vroland/epdiy
 

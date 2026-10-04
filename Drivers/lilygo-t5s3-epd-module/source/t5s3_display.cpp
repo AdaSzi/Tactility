@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "t5s3_display.h"
+#include <drivers/t5s3_display.h>
+#include <lilygo_t5s3_epd_module.h>
 
 #include <tactility/device.h>
 #include <tactility/driver.h>
@@ -54,8 +55,6 @@ static inline uint8_t dither_to_bw_nibble(uint8_t luminance, int32_t x, int32_t 
 }
 
 extern "C" {
-
-extern Module lilygo_t5_epd47_s3_module;
 
 struct T5s3DisplayInternal {
     uint8_t* framebuffer;
@@ -303,7 +302,7 @@ Driver t5s3_display_driver = {
     .probe = nullptr,
     .api = &t5s3_display_api,
     .device_type = &DISPLAY_TYPE,
-    .owner = &lilygo_t5_epd47_s3_module,
+    .owner = &lilygo_t5s3_epd_module,
     .internal = nullptr
 };
 
