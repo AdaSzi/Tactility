@@ -74,9 +74,12 @@ static bool is_expander_pin(const GpioPinSpec& pin) {
 }
 
 // esp_lcd_touch only accepts native pins, so the reset is done here. INT is held low while reset
-// is released, which selects address 0x5D. Physical levels are used because IO expanders reject
-// ACTIVE_LOW on outputs.
-static error_t reset_with_expander_pins(const GpioPinSpec& reset_pin, const GpioPinSpec& interrupt_pin) {
+// is released, which selects address 0x5D.
+static error_t reset_with_expander_pins(const GpioPinSpec& reset_pin, const GpioPinSpec& interrupt_pin, uint8_t pulses) {
+    if (pulses == 0) {
+        return ERROR_NONE;
+    }
+
     GpioDescriptor* interrupt = nullptr;
     if (interrupt_pin.gpio_controller != nullptr) {
         interrupt = gpio_descriptor_acquire(interrupt_pin.gpio_controller, interrupt_pin.pin, GPIO_FLAG_DIRECTION_OUTPUT, GPIO_OWNER_GPIO);
@@ -86,9 +89,14 @@ static error_t reset_with_expander_pins(const GpioPinSpec& reset_pin, const Gpio
         }
     }
 
+    // A native reset pin keeps its configured polarity. An expander pin is driven active-low at
+    // physical levels because IO expanders reject ACTIVE_LOW on outputs.
+    bool reset_on_expander = is_expander_pin(reset_pin);
+    bool asserted_level = !reset_on_expander;
     GpioDescriptor* reset = nullptr;
     if (reset_pin.gpio_controller != nullptr) {
-        reset = gpio_descriptor_acquire(reset_pin.gpio_controller, reset_pin.pin, GPIO_FLAG_DIRECTION_OUTPUT, GPIO_OWNER_GPIO);
+        gpio_flags_t reset_flags = reset_on_expander ? GPIO_FLAG_DIRECTION_OUTPUT : (reset_pin.flags | GPIO_FLAG_DIRECTION_OUTPUT);
+        reset = gpio_descriptor_acquire(reset_pin.gpio_controller, reset_pin.pin, reset_flags, GPIO_OWNER_GPIO);
         if (reset == nullptr) {
             LOG_E(TAG, "Failed to acquire reset pin");
             if (interrupt != nullptr) {
@@ -102,15 +110,15 @@ static error_t reset_with_expander_pins(const GpioPinSpec& reset_pin, const Gpio
     if (interrupt != nullptr) {
         error = gpio_descriptor_set_level(interrupt, false);
     }
-    if (error == ERROR_NONE && reset != nullptr) {
-        error = gpio_descriptor_set_level(reset, false);
+    for (uint8_t i = 0; error == ERROR_NONE && reset != nullptr && i < pulses; i++) {
+        error = gpio_descriptor_set_level(reset, asserted_level);
         if (error == ERROR_NONE) {
             vTaskDelay(pdMS_TO_TICKS(10));
-            error = gpio_descriptor_set_level(reset, true);
+            error = gpio_descriptor_set_level(reset, !asserted_level);
         }
-    }
-    if (error == ERROR_NONE) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+        if (error == ERROR_NONE) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
 
     if (interrupt != nullptr) {
@@ -215,7 +223,7 @@ static error_t start(Device* device) {
 
     bool expander_pins = is_expander_pin(config->pin_reset) || is_expander_pin(config->pin_interrupt);
     error_t error = expander_pins
-        ? reset_with_expander_pins(config->pin_reset, config->pin_interrupt)
+        ? reset_with_expander_pins(config->pin_reset, config->pin_interrupt, config->reset_pulses)
         : reset_controller_pin(config->pin_reset, config->reset_pulses);
     if (error != ERROR_NONE) {
         free(internal);
