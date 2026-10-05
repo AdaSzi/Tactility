@@ -16,12 +16,12 @@ properties:
   high-current:
     type: boolean
     default: false
-    description: Use the 51 mA maximum output current range instead of 25.5 mA
+    description: Use a maximum output current of 51 mA instead of 25.5 mA
   dot-current:
     type: int
     default: 255
-    description: Output current as a fraction of the maximum current [0,255]
+    description: Output current per enabled output in 1/255 of the maximum current [0,255], so 0.2 mA steps at 51 mA and 0.1 mA steps at 25.5 mA
   brightness-default:
     type: int
     default: 255
-    description: Default brightness level, applied by set_brightness_default()
+    description: Default brightness level (PWM duty in 1/255), applied by set_brightness_default()

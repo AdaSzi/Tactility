@@ -10,7 +10,7 @@
 #include <tactility/drivers/i2c_controller.h>
 #include <tactility/log.h>
 
-#define TAG "ADS1115"
+constexpr auto* TAG = "ADS1115";
 #define GET_CONFIG(device) (static_cast<const Ads1115Config*>((device)->config))
 
 static constexpr uint8_t REG_CONVERSION = 0x00;

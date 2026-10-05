@@ -45,22 +45,22 @@ static int pin_or_unused(const struct GpioPinSpec& pin) {
     return pin.gpio_controller == nullptr ? -1 : static_cast<int>(pin.pin);
 }
 
-// Drives physical levels because IO expanders reject ACTIVE_LOW on outputs
+// The reset line of the NV3031B is active-low
 static error_t hardware_reset(const struct GpioPinSpec& pin) {
     if (pin.gpio_controller == nullptr) {
         return ERROR_NONE;
     }
 
-    auto* reset = gpio_descriptor_acquire(pin.gpio_controller, pin.pin, GPIO_FLAG_DIRECTION_OUTPUT, GPIO_OWNER_GPIO);
+    auto* reset = gpio_descriptor_acquire(pin.gpio_controller, pin.pin, GPIO_FLAG_DIRECTION_OUTPUT | GPIO_FLAG_ACTIVE_LOW, GPIO_OWNER_GPIO);
     if (reset == nullptr) {
         LOG_E(TAG, "Failed to acquire reset pin");
         return ERROR_RESOURCE;
     }
 
-    error_t error = gpio_descriptor_set_level(reset, false);
+    error_t error = gpio_descriptor_set_level(reset, true);
     if (error == ERROR_NONE) {
         delay_millis(10);
-        error = gpio_descriptor_set_level(reset, true);
+        error = gpio_descriptor_set_level(reset, false);
     }
     gpio_descriptor_release(reset);
     if (error != ERROR_NONE) {

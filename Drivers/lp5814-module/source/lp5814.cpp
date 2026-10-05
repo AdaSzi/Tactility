@@ -12,7 +12,7 @@
 
 #include <new>
 
-#define TAG "LP5814"
+constexpr auto* TAG = "LP5814";
 #define GET_CONFIG(device) (static_cast<const Lp5814Config*>((device)->config))
 #define GET_INTERNAL(device) (static_cast<Lp5814Internal*>(device_get_driver_data(device)))
 

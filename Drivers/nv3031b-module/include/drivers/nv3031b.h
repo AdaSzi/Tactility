@@ -23,7 +23,7 @@ struct Nv3031bConfig {
     bool bgr_order;
     uint32_t pixel_clock_hz;
     uint8_t transaction_queue_depth;
-    // Active-low reset line, may be on an IO expander.
+    // Reset line, driven active-low. May be on an IO expander.
     struct GpioPinSpec pin_reset;
     // Optional reference to this display's backlight device, NULL if none.
     struct Device* backlight;

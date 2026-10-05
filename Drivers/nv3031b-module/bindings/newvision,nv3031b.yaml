@@ -52,7 +52,7 @@ properties:
   pin-reset:
     type: phandles
     default: GPIO_PIN_SPEC_NONE
-    description: Active-low reset pin. Pins on an IO expander are supported.
+    description: Reset pin, driven active-low by the driver. Pins on an IO expander are supported.
   backlight:
     type: phandle
     default: "NULL"

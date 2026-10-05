@@ -14,7 +14,7 @@
 #include <esp_codec_dev.h>
 #include <esp_codec_dev_defaults.h>
 
-#define TAG "ES7243E"
+constexpr auto* TAG = "ES7243E";
 
 namespace {
 
