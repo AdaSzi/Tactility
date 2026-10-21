@@ -1,596 +1,422 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //
-// Minimal driver for the ED047TC1 panel of the LILYGO T5 4.7 Inch E-Paper S3.
-// The sequences and timings follow the epdiy project (https://github.com/vroland/epdiy).
+// Waveform updates of the ED047TC1 panel of the LILYGO T5 4.7 Inch E-Paper S3.
+// The update logic follows the epdiy project (https://github.com/vroland/epdiy).
 //
-// The panel is controlled by a 74HCT4094 shift register (latch, output enable, mode, start of frame and the
-// panel supplies), the CKV gate clock (RMT peripheral) and an 8 bit bus (LCD peripheral in i80 mode) that
-// carries the 2 bit actions of 4 pixels per byte. Rows are sent one at a time. The data of a row is applied by the
-// CKV pulse after the one that was running during its transfer.
+// Each update diffs the frame buffer (front) against what the panel shows (back), sends only the rows that changed
+// and only drives the columns that changed.
 
 #include "t5s3_epd.h"
 
 #include <tactility/log.h>
+#include <tactility/memory.h>
 
-#include <driver/gpio.h>
-#include <driver/rmt_encoder.h>
-#include <driver/rmt_tx.h>
-#include <esp_heap_caps.h>
-#include <esp_lcd_io_i80.h>
-#include <esp_lcd_panel_io.h>
-#include <esp_rom_sys.h>
+#include <esp_attr.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <hal/gpio_ll.h>
-#include <soc/gpio_struct.h>
 
 #include <cstring>
 
 #define TAG "T5s3Epd"
 
-static constexpr gpio_num_t PIN_REGISTER_DATA = GPIO_NUM_13;
-static constexpr gpio_num_t PIN_REGISTER_CLOCK = GPIO_NUM_12;
-static constexpr gpio_num_t PIN_REGISTER_STROBE = GPIO_NUM_0;
-static constexpr gpio_num_t PIN_CKV = GPIO_NUM_38;
-// Start pulse of a row, driven as the data/command line of the bus
-static constexpr gpio_num_t PIN_STH = GPIO_NUM_40;
-// Pixel clock, driven as the write line of the bus
-static constexpr gpio_num_t PIN_CKH = GPIO_NUM_41;
-static constexpr gpio_num_t BUS_PINS[8] = {GPIO_NUM_6, GPIO_NUM_7, GPIO_NUM_4, GPIO_NUM_5, GPIO_NUM_2, GPIO_NUM_3, GPIO_NUM_8, GPIO_NUM_1};
+// A pixel keeps its drive until its row is addressed again, so the drive of a phase depends on the length of the frame.
+// Frames are padded to a fixed period, which makes an update of a few rows drive as long as one of the whole panel.
+// Black needs about 32 frames to get as dark as the waveform makes it and white about 8 to leave black. The fast update
+// stops at a dark gray for black, the refresh completes it.
+static constexpr uint32_t FAST_PHASES = 8;
+static constexpr int64_t FAST_FRAME_US = 16667;
+// Gate pulse of a row of the fast update in units of 0.1 us
+static constexpr uint32_t FAST_HOLD_TICKS = 120;
+// Duration of a frame of the whole panel, the gray levels of the waveform were measured with it
+static constexpr int64_t QUALITY_FRAME_US = 40000;
+// Frames that settle the pixels of a refresh before the waveform. Black pixels get the rest of their drive and white
+// pixels go further toward white. Gray pixels are shaken: REFRESH_SHAKE_FRAMES frames toward black and the rest toward
+// white, which erases what they showed before, also a black that was shown for a long time. The waveform then draws
+// their gray levels like from a clean white.
+static constexpr int REFRESH_SETTLE_FRAMES = 24;
+static constexpr int REFRESH_SHAKE_FRAMES = 8;
 
-// A row has headroom after the pixel data for the timing of the source driver
-static constexpr int BUS_TRANSFER_BYTES = ((T5S3_EPD_WIDTH + 32) / 4 + 3) & ~3;
-
-// Time base of the CKV pulses, 10 MHz
-static constexpr uint32_t PULSE_RESOLUTION_HZ = 10000000;
-// Low time after the pulse of a row in ticks
-static constexpr uint32_t ROW_LOW_TICKS = 50;
-// More phases drive the pixels further into black or white, which leaves less ghosting but makes fast updates slower
-static constexpr uint32_t FAST_PHASES = 10;
-// Hold time of a phase of the fast update in ticks
-static constexpr uint32_t FAST_HOLD_TICKS = 1000;
+// 1 bit per pixel
+static constexpr int TOUCHED_ROW_BYTES = T5S3_EPD_WIDTH / 8;
+static constexpr int TOUCHED_BYTES = TOUCHED_ROW_BYTES * T5S3_EPD_HEIGHT;
 // Hold time of the frames that flash the panel to white
 static constexpr uint32_t CLEAR_HOLD_TICKS = 120;
 static constexpr int CLEAR_CYCLES = 3;
 static constexpr int CLEAR_DARK_FRAMES = 10;
 static constexpr int CLEAR_LIGHT_FRAMES = 10;
 static constexpr int CLEAR_REST_FRAMES = 2;
-static constexpr uint8_t ALL_DARK = 0x55;
-static constexpr uint8_t ALL_LIGHT = 0xAA;
-
-// Limit for waiting on a flag that an interrupt handler sets, so that a lost interrupt fails the update instead of spinning forever
-static constexpr uint32_t WAIT_SPIN_LIMIT = 20000000;
 
 struct Engine {
-    uint8_t* front = nullptr;
-    uint8_t* back = nullptr;
-    uint8_t* row_buffer[2] = {nullptr, nullptr};
-    int current = 0;
-    esp_lcd_i80_bus_handle_t bus = nullptr;
-    esp_lcd_panel_io_handle_t io = nullptr;
-    rmt_channel_handle_t pulse_channel = nullptr;
-    rmt_encoder_handle_t pulse_encoder = nullptr;
-    volatile bool transfer_done = true;
-    volatile bool pulse_done = true;
-    bool failed = false;
-    // Shift register
-    bool latch = false;
-    bool output_enable = false;
-    bool mode = false;
-    bool start_of_frame = true;
-    bool power_disable = true;
-    bool positive_power = false;
-    bool negative_power = false;
-    // Rows written since the last row that carried data
-    int rows_skipped = 0;
+    uint8_t* front;
+    uint8_t* back;
+    // Black and white targets of the fast update
+    uint8_t* dither;
+    // Pixels that a fast update drove since their last refresh, 1 bit per pixel
+    uint8_t* touched;
+    // Targets of the fast update being sent, dithered where front differs from back
+    uint8_t* fast;
+    // Targets of the update being sent
+    const uint8_t* to;
+    // Actions of the phase being sent
+    uint8_t table[256];
+    // Areas of the refresh being sent
+    const T5s3EpdRect* rects;
+    int rect_count;
+    int settle_frame;
     bool row_dirty[T5S3_EPD_HEIGHT];
     alignas(4) uint8_t changes[T5S3_EPD_FB_ROW_BYTES];
     alignas(4) uint8_t line_mask[T5S3_EPD_BUS_ROW_BYTES];
 };
 
-static Engine engine;
-static rmt_symbol_word_t pulse_symbol;
+static Engine* engine = nullptr;
 
-static inline void IRAM_ATTR pin_set(gpio_num_t pin, uint32_t level) {
-    gpio_ll_set_level(GPIO_LL_GET_HW(GPIO_PORT_0), pin, level);
-}
-
-static bool IRAM_ATTR on_pulse_done(rmt_channel_handle_t, const rmt_tx_done_event_data_t*, void*) {
-    engine.pulse_done = true;
-    return false;
-}
-
-static bool IRAM_ATTR on_transfer_done(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t*, void*) {
-    engine.transfer_done = true;
-    return false;
-}
-
-// After a failure nothing is waited for anymore, so the rest of the update ends quickly
-static void IRAM_ATTR wait_for(volatile bool& flag) {
-    uint32_t spins = 0;
-    while (!flag) {
-        if (engine.failed || ++spins > WAIT_SPIN_LIMIT) {
-            engine.failed = true;
-            flag = true;
-        }
+// Sleeps for most of the rest of the period, which also lets the idle task feed the watchdog
+static void pad_frame(int64_t frame_start_us, int64_t period_us) {
+    const int64_t remaining_us = period_us - (esp_timer_get_time() - frame_start_us);
+    if (remaining_us > 2000) {
+        vTaskDelay(pdMS_TO_TICKS((remaining_us - 1000) / 1000));
     }
+    while (esp_timer_get_time() - frame_start_us < period_us) {}
 }
 
-// region Shift register
-
-static void IRAM_ATTR push_register_bit(bool bit) {
-    pin_set(PIN_REGISTER_CLOCK, 0);
-    pin_set(PIN_REGISTER_DATA, bit ? 1 : 0);
-    pin_set(PIN_REGISTER_CLOCK, 1);
-}
-
-static void IRAM_ATTR push_register() {
-    pin_set(PIN_REGISTER_STROBE, 0);
-    push_register_bit(engine.output_enable);
-    push_register_bit(engine.mode);
-    // Always set
-    push_register_bit(true);
-    push_register_bit(engine.start_of_frame);
-    push_register_bit(engine.negative_power);
-    push_register_bit(engine.positive_power);
-    push_register_bit(engine.power_disable);
-    push_register_bit(engine.latch);
-    pin_set(PIN_REGISTER_STROBE, 1);
-}
-
-// endregion
-
-// region CKV pulses and row transfer
-
-// Pulses the gate clock for high_ticks and keeps it low for low_ticks, repeated for the given number of pulses.
-// Without a high time the line is high for low_ticks.
-static void IRAM_ATTR pulse_ckv(uint32_t high_ticks, uint32_t low_ticks, bool wait, int count = 1) {
-    wait_for(engine.pulse_done);
-    if (high_ticks > 0) {
-        pulse_symbol.duration0 = high_ticks;
-        pulse_symbol.level0 = 1;
-        pulse_symbol.duration1 = low_ticks;
-        pulse_symbol.level1 = 0;
-    } else {
-        pulse_symbol.duration0 = low_ticks;
-        pulse_symbol.level0 = 1;
-        pulse_symbol.duration1 = 0;
-        pulse_symbol.level1 = 0;
-    }
-    engine.pulse_done = false;
-    rmt_transmit_config_t config = {};
-    config.loop_count = count;
-    if (rmt_transmit(engine.pulse_channel, engine.pulse_encoder, &pulse_symbol, sizeof(pulse_symbol), &config) != ESP_OK) {
-        engine.pulse_done = true;
-        engine.failed = true;
-        return;
-    }
-    if (wait) {
-        wait_for(engine.pulse_done);
-    }
-}
-
-static void IRAM_ATTR pulse_ckv_us(uint32_t high_us, uint32_t low_us, bool wait) {
-    pulse_ckv(high_us * 10, low_us * 10, wait);
-}
-
-static void IRAM_ATTR start_transfer() {
-    engine.transfer_done = false;
-    if (esp_lcd_panel_io_tx_color(engine.io, 0, engine.row_buffer[engine.current], BUS_TRANSFER_BYTES) != ESP_OK) {
-        engine.transfer_done = true;
-        engine.failed = true;
-    }
-}
-
-// Applies the data that was sent last and starts the transfer of the current row buffer while the CKV pulse runs
-static void IRAM_ATTR output_row(uint32_t hold_ticks) {
-    wait_for(engine.transfer_done);
-    wait_for(engine.pulse_done);
-    engine.latch = true;
-    push_register();
-    engine.latch = false;
-    push_register();
-    pulse_ckv(hold_ticks, ROW_LOW_TICKS, false);
-    start_transfer();
-    engine.current ^= 1;
-}
-
-static void IRAM_ATTR write_row(uint32_t hold_ticks) {
-    output_row(hold_ticks);
-    engine.rows_skipped = 0;
-}
-
-// Skips a row after rows with data. The first two skipped rows push blank data through the pipeline.
-static void IRAM_ATTR skip_row(uint32_t hold_ticks) {
-    memset(engine.row_buffer[engine.current], 0, T5S3_EPD_BUS_ROW_BYTES);
-    output_row(hold_ticks);
-    engine.rows_skipped++;
-}
-
-// Clocks the gate driver through rows that carry no data with one train of pulses
-static void IRAM_ATTR skip_rows(int count) {
-    pulse_ckv(45, 5, false, count);
-    engine.rows_skipped += count;
-}
-
-static void IRAM_ATTR start_frame() {
-    wait_for(engine.transfer_done);
-    wait_for(engine.pulse_done);
-    engine.rows_skipped = 0;
-
-    engine.mode = true;
-    push_register();
-    pulse_ckv_us(1, 1, true);
-
-    // The start of frame line must go low and high again while the long pulse runs
-    engine.start_of_frame = false;
-    push_register();
-    pulse_ckv_us(1000, 100, false);
-    engine.start_of_frame = true;
-    push_register();
-    for (int i = 0; i < 4; i++) {
-        pulse_ckv_us(1, 1, true);
-    }
-
-    engine.output_enable = true;
-    push_register();
-}
-
-static void IRAM_ATTR end_frame() {
-    engine.start_of_frame = false;
-    push_register();
-    for (int i = 0; i < 5; i++) {
-        pulse_ckv_us(1, 1, true);
-    }
-    engine.mode = false;
-    push_register();
-    pulse_ckv_us(0, 10, true);
-    engine.output_enable = false;
-    push_register();
-    for (int i = 0; i < 3; i++) {
-        pulse_ckv_us(1, 1, true);
-    }
-}
-
-// endregion
-
-// region Frames
-
-static void IRAM_ATTR draw_frame(const uint8_t* table, uint32_t hold_ticks) {
-    start_frame();
-    int y = 0;
-    bool ends_with_train = false;
-    while (y < T5S3_EPD_HEIGHT && !engine.failed) {
-        ends_with_train = false;
-        if (engine.row_dirty[y]) {
-            t5s3_epd_prepare_row(
-                engine.row_buffer[engine.current],
-                engine.front + y * T5S3_EPD_FB_ROW_BYTES,
-                engine.back + y * T5S3_EPD_FB_ROW_BYTES,
-                table,
-                engine.line_mask
-            );
-            write_row(hold_ticks);
-            y++;
-        } else if (engine.rows_skipped < 2) {
-            skip_row(hold_ticks);
-            y++;
-        } else {
-            int run = 1;
-            while (y + run < T5S3_EPD_HEIGHT && !engine.row_dirty[y + run]) {
-                run++;
-            }
-            skip_rows(run);
-            ends_with_train = true;
-            y += run;
-        }
-    }
-    // The last row is applied by one more pulse
-    if (engine.rows_skipped == 0 && !engine.failed) {
-        write_row(hold_ticks);
-    } else if (ends_with_train) {
-        // The end of the frame must not overlap the train of pulses of the skipped rows
-        wait_for(engine.pulse_done);
-    }
-    end_frame();
-}
-
-static void IRAM_ATTR draw_uniform_frame(uint8_t pattern, uint32_t hold_ticks) {
-    memset(engine.row_buffer[0], pattern, T5S3_EPD_BUS_ROW_BYTES);
-    memset(engine.row_buffer[1], pattern, T5S3_EPD_BUS_ROW_BYTES);
-    start_frame();
-    for (int y = 0; y < T5S3_EPD_HEIGHT && !engine.failed; y++) {
-        write_row(hold_ticks);
-    }
-    if (!engine.failed) {
-        write_row(hold_ticks);
-    }
-    end_frame();
-}
-
-// endregion
-
-// region Setup
-
-static bool setup_register_pins() {
-    gpio_config_t config = {};
-    config.pin_bit_mask = (1ULL << PIN_REGISTER_DATA) | (1ULL << PIN_REGISTER_CLOCK) | (1ULL << PIN_REGISTER_STROBE);
-    config.mode = GPIO_MODE_OUTPUT;
-    if (gpio_config(&config) != ESP_OK) {
-        return false;
-    }
-    pin_set(PIN_REGISTER_STROBE, 0);
-    return true;
-}
-
-static bool setup_bus(uint32_t pixel_clock_hz) {
-    esp_lcd_i80_bus_config_t bus_config = {};
-    bus_config.dc_gpio_num = PIN_STH;
-    bus_config.wr_gpio_num = PIN_CKH;
-    bus_config.clk_src = LCD_CLK_SRC_DEFAULT;
-    for (int i = 0; i < 8; i++) {
-        bus_config.data_gpio_nums[i] = BUS_PINS[i];
-    }
-    bus_config.bus_width = 8;
-    bus_config.max_transfer_bytes = BUS_TRANSFER_BYTES;
-    if (esp_lcd_new_i80_bus(&bus_config, &engine.bus) != ESP_OK) {
-        return false;
-    }
-
-    // The data/command line is low when idle, high during a dummy command phase and low during the data of a row
-    esp_lcd_panel_io_i80_config_t io_config = {};
-    io_config.cs_gpio_num = GPIO_NUM_NC;
-    io_config.pclk_hz = pixel_clock_hz;
-    io_config.trans_queue_depth = 4;
-    io_config.on_color_trans_done = on_transfer_done;
-    io_config.lcd_cmd_bits = 10;
-    io_config.lcd_param_bits = 0;
-    io_config.dc_levels.dc_idle_level = 0;
-    io_config.dc_levels.dc_cmd_level = 1;
-    io_config.dc_levels.dc_dummy_level = 0;
-    io_config.dc_levels.dc_data_level = 0;
-    return esp_lcd_new_panel_io_i80(engine.bus, &io_config, &engine.io) == ESP_OK;
-}
-
-static bool setup_pulse() {
-    rmt_tx_channel_config_t channel_config = {};
-    channel_config.gpio_num = PIN_CKV;
-    channel_config.clk_src = RMT_CLK_SRC_DEFAULT;
-    channel_config.resolution_hz = PULSE_RESOLUTION_HZ;
-    channel_config.mem_block_symbols = 48;
-    channel_config.trans_queue_depth = 1;
-    if (rmt_new_tx_channel(&channel_config, &engine.pulse_channel) != ESP_OK) {
-        return false;
-    }
-    rmt_copy_encoder_config_t encoder_config = {};
-    if (rmt_new_copy_encoder(&encoder_config, &engine.pulse_encoder) != ESP_OK) {
-        return false;
-    }
-    rmt_tx_event_callbacks_t callbacks = {};
-    callbacks.on_trans_done = on_pulse_done;
-    if (rmt_tx_register_event_callbacks(engine.pulse_channel, &callbacks, nullptr) != ESP_OK) {
-        return false;
-    }
-    return rmt_enable(engine.pulse_channel) == ESP_OK;
+static void IRAM_ATTR prepare_row(int y, uint8_t* out, void*) {
+    t5s3_epd_prepare_row(
+        out,
+        engine->to + y * T5S3_EPD_FB_ROW_BYTES,
+        engine->back + y * T5S3_EPD_FB_ROW_BYTES,
+        engine->table,
+        engine->line_mask
+    );
 }
 
 bool t5s3_epd_init(uint32_t pixel_clock_hz) {
-    if (engine.front != nullptr) {
+    if (engine != nullptr) {
         return true;
     }
-
-    engine.front = static_cast<uint8_t*>(heap_caps_aligned_alloc(16, T5S3_EPD_FB_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    engine.back = static_cast<uint8_t*>(heap_caps_aligned_alloc(16, T5S3_EPD_FB_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    for (auto& buffer: engine.row_buffer) {
-        buffer = static_cast<uint8_t*>(heap_caps_aligned_calloc(16, 1, BUS_TRANSFER_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    static const MemoryPolicy external_policy = { .required = 0, .desired = MEMORY_CAPABILITY_EXTERNAL, .alignment = 16 };
+    engine = static_cast<Engine*>(memory_calloc_with_policy(1, sizeof(Engine), &external_policy));
+    if (engine == nullptr) {
+        LOG_E(TAG, "Out of memory");
+        return false;
     }
-    if (engine.front == nullptr || engine.back == nullptr || engine.row_buffer[0] == nullptr || engine.row_buffer[1] == nullptr) {
+    engine->front = static_cast<uint8_t*>(memory_alloc_with_policy(T5S3_EPD_FB_BYTES, &external_policy));
+    engine->back = static_cast<uint8_t*>(memory_alloc_with_policy(T5S3_EPD_FB_BYTES, &external_policy));
+    engine->dither = static_cast<uint8_t*>(memory_alloc_with_policy(T5S3_EPD_FB_BYTES, &external_policy));
+    engine->fast = static_cast<uint8_t*>(memory_alloc_with_policy(T5S3_EPD_FB_BYTES, &external_policy));
+    engine->touched = static_cast<uint8_t*>(memory_calloc_with_policy(1, TOUCHED_BYTES, &external_policy));
+    if (engine->front == nullptr || engine->back == nullptr || engine->dither == nullptr || engine->fast == nullptr || engine->touched == nullptr) {
         LOG_E(TAG, "Out of memory");
         t5s3_epd_deinit();
         return false;
     }
-    memset(engine.front, 0xFF, T5S3_EPD_FB_BYTES);
-    memset(engine.back, 0xFF, T5S3_EPD_FB_BYTES);
+    memset(engine->front, 0xFF, T5S3_EPD_FB_BYTES);
+    memset(engine->back, 0xFF, T5S3_EPD_FB_BYTES);
+    memset(engine->dither, 0xFF, T5S3_EPD_FB_BYTES);
 
-    if (!setup_register_pins() || !setup_bus(pixel_clock_hz) || !setup_pulse()) {
+    if (!t5s3_epd_board_init(pixel_clock_hz)) {
         LOG_E(TAG, "Failed to set up the pins and peripherals");
         t5s3_epd_deinit();
         return false;
     }
-
-    engine.latch = false;
-    engine.output_enable = false;
-    engine.mode = false;
-    engine.start_of_frame = true;
-    engine.power_disable = true;
-    engine.positive_power = false;
-    engine.negative_power = false;
-    engine.current = 0;
-    engine.transfer_done = true;
-    engine.pulse_done = true;
-    push_register();
     return true;
 }
 
 void t5s3_epd_deinit() {
-    if (engine.pulse_channel != nullptr) {
-        // Both calls fail harmlessly when the channel was not enabled
-        rmt_disable(engine.pulse_channel);
-        rmt_del_channel(engine.pulse_channel);
-        engine.pulse_channel = nullptr;
+    if (engine == nullptr) {
+        return;
     }
-    if (engine.pulse_encoder != nullptr) {
-        rmt_del_encoder(engine.pulse_encoder);
-        engine.pulse_encoder = nullptr;
-    }
-    if (engine.io != nullptr) {
-        esp_lcd_panel_io_del(engine.io);
-        engine.io = nullptr;
-    }
-    if (engine.bus != nullptr) {
-        esp_lcd_del_i80_bus(engine.bus);
-        engine.bus = nullptr;
-    }
-    heap_caps_free(engine.front);
-    heap_caps_free(engine.back);
-    heap_caps_free(engine.row_buffer[0]);
-    heap_caps_free(engine.row_buffer[1]);
-    engine.front = nullptr;
-    engine.back = nullptr;
-    engine.row_buffer[0] = nullptr;
-    engine.row_buffer[1] = nullptr;
+    t5s3_epd_board_deinit();
+    memory_free(engine->front);
+    memory_free(engine->back);
+    memory_free(engine->dither);
+    memory_free(engine->fast);
+    memory_free(engine->touched);
+    memory_free(engine);
+    engine = nullptr;
 }
-
-// endregion
-
-// region Power
-
-void t5s3_epd_power_on() {
-    engine.power_disable = false;
-    push_register();
-    esp_rom_delay_us(100);
-    engine.negative_power = true;
-    push_register();
-    esp_rom_delay_us(500);
-    engine.positive_power = true;
-    push_register();
-    esp_rom_delay_us(100);
-    engine.start_of_frame = true;
-    push_register();
-}
-
-void t5s3_epd_power_off() {
-    engine.positive_power = false;
-    push_register();
-    esp_rom_delay_us(10);
-    engine.negative_power = false;
-    push_register();
-    esp_rom_delay_us(100);
-    engine.start_of_frame = false;
-    engine.output_enable = false;
-    engine.mode = false;
-    engine.power_disable = true;
-    push_register();
-}
-
-// endregion
-
-// region Updates
 
 uint8_t* t5s3_epd_framebuffer() {
-    return engine.front;
+    return engine->front;
+}
+
+uint8_t* t5s3_epd_dither_buffer() {
+    return engine->dither;
 }
 
 void t5s3_epd_fill_white() {
-    memset(engine.front, 0xFF, T5S3_EPD_FB_BYTES);
+    memset(engine->front, 0xFF, T5S3_EPD_FB_BYTES);
+    memset(engine->dither, 0xFF, T5S3_EPD_FB_BYTES);
 }
 
-void t5s3_epd_invalidate() {
-    auto* words = reinterpret_cast<uint32_t*>(engine.back);
-    for (int i = 0; i < T5S3_EPD_FB_BYTES / 4; i++) {
-        words[i] = ~words[i];
+// Pixels whose level changed get their black or white target, the others keep what the panel shows.
+// first and last get the first and last group of 8 pixels with a change, or -1 for a row without changes.
+static void build_fast_row(int y, int* first, int* last) {
+    const size_t offset = y * T5S3_EPD_FB_ROW_BYTES;
+    const uint8_t* front = engine->front + offset;
+    const uint8_t* back = engine->back + offset;
+    const uint8_t* dither = engine->dither + offset;
+    uint8_t* fast = engine->fast + offset;
+    uint8_t* touched = engine->touched + y * TOUCHED_ROW_BYTES;
+    *first = -1;
+    *last = -1;
+    for (int i = 0; i < T5S3_EPD_FB_ROW_BYTES; i++) {
+        const uint8_t difference = front[i] ^ back[i];
+        uint8_t changed = 0;
+        changed |= (difference & 0x0F) != 0 ? 0x0F : 0x00;
+        changed |= (difference & 0xF0) != 0 ? 0xF0 : 0x00;
+        fast[i] = static_cast<uint8_t>((dither[i] & changed) | (back[i] & ~changed));
+        // Byte i holds the pixels 2i and 2i + 1
+        const int bit = (i & 3) * 2;
+        touched[i / 4] |= static_cast<uint8_t>((((changed & 0x0F) != 0 ? 1 : 0) | ((changed & 0xF0) != 0 ? 2 : 0)) << bit);
+        if (changed != 0) {
+            *first = *first < 0 ? i / 4 : *first;
+            *last = i / 4;
+        }
     }
 }
 
-bool t5s3_epd_update(T5s3EpdMode mode, int32_t y_start, int32_t y_end) {
+bool t5s3_epd_show_changes(int32_t y_start, int32_t y_end, T5s3EpdRect* changed) {
+    *changed = { 0, 0, 0, 0 };
     if (y_start < 0) {
         y_start = 0;
     }
     if (y_end > T5S3_EPD_HEIGHT) {
         y_end = T5S3_EPD_HEIGHT;
     }
-    if (y_start >= y_end) {
-        return true;
-    }
     const int64_t started = esp_timer_get_time();
 
     // Find the rows and columns that changed
-    memset(engine.row_dirty, 0, sizeof(engine.row_dirty));
-    memset(engine.changes, 0, sizeof(engine.changes));
-    auto* changes = reinterpret_cast<uint32_t*>(engine.changes);
-    bool any_changes = false;
+    memset(engine->row_dirty, 0, sizeof(engine->row_dirty));
+    memset(engine->changes, 0, sizeof(engine->changes));
+    auto* changes = reinterpret_cast<uint32_t*>(engine->changes);
+    int changed_rows = 0;
+    int driven_rows = 0;
+    int first_group = T5S3_EPD_WIDTH;
+    int last_group = -1;
     for (int y = y_start; y < y_end; y++) {
-        const auto* to_row = reinterpret_cast<const uint32_t*>(engine.front + y * T5S3_EPD_FB_ROW_BYTES);
-        const auto* from_row = reinterpret_cast<const uint32_t*>(engine.back + y * T5S3_EPD_FB_ROW_BYTES);
+        int first;
+        int last;
+        build_fast_row(y, &first, &last);
+        if (first < 0) {
+            continue;
+        }
+        if (changed_rows == 0) {
+            changed->y0 = y;
+        }
+        changed->y1 = y + 1;
+        first_group = first < first_group ? first : first_group;
+        last_group = last > last_group ? last : last_group;
+        changed_rows++;
+
+        const auto* to_row = reinterpret_cast<const uint32_t*>(engine->fast + y * T5S3_EPD_FB_ROW_BYTES);
+        const auto* from_row = reinterpret_cast<const uint32_t*>(engine->back + y * T5S3_EPD_FB_ROW_BYTES);
         uint32_t row_changes = 0;
         for (int i = 0; i < T5S3_EPD_FB_ROW_BYTES / 4; i++) {
             const uint32_t difference = to_row[i] ^ from_row[i];
             changes[i] |= difference;
             row_changes |= difference;
         }
-        engine.row_dirty[y] = row_changes != 0;
-        any_changes = any_changes || row_changes != 0;
+        engine->row_dirty[y] = row_changes != 0;
+        driven_rows += row_changes != 0 ? 1 : 0;
     }
-    if (!any_changes) {
+    if (changed_rows == 0) {
         return true;
     }
-    t5s3_epd_build_line_mask(engine.line_mask, engine.changes);
+    changed->x0 = first_group * 8;
+    changed->x1 = (last_group + 1) * 8;
 
-    engine.failed = false;
-    uint8_t table[256];
-    if (mode == T5s3EpdMode::Fast) {
-        t5s3_epd_build_fast_table(table);
-        for (uint32_t phase = 0; phase < FAST_PHASES && !engine.failed; phase++) {
-            draw_frame(table, FAST_HOLD_TICKS);
-            taskYIELD();
+    // Pixels whose dither is what the panel shows already are only drawn by the refresh
+    if (driven_rows > 0) {
+        t5s3_epd_build_line_mask(engine->line_mask, engine->changes);
+        t5s3_epd_build_fast_table(engine->table);
+        engine->to = engine->fast;
+        bool success = true;
+        for (uint32_t phase = 0; phase < FAST_PHASES && success; phase++) {
+            const int64_t frame_start_us = esp_timer_get_time();
+            success = t5s3_epd_board_frame(changed->y0, changed->y1, engine->row_dirty, FAST_HOLD_TICKS, prepare_row, nullptr);
+            pad_frame(frame_start_us, FAST_FRAME_US);
         }
-    } else {
-        // Long updates sleep between frames so that the idle task can feed the watchdog
-        for (int phase = 0; phase < T5S3_EPD_QUALITY_PHASES && !engine.failed; phase++) {
-            t5s3_epd_build_quality_table(table, phase, mode == T5s3EpdMode::Full);
-            draw_frame(table, T5S3_EPD_QUALITY_HOLD[phase]);
-            vTaskDelay(1);
+        // A failed update leaves the back buffer alone, so the next update draws the same rows again
+        if (!success) {
+            LOG_E(TAG, "Update failed, a peripheral did not respond");
+            return false;
         }
-    }
-
-    // A failed update leaves the back buffer alone, so the next update draws the same rows again
-    if (engine.failed) {
-        LOG_E(TAG, "Update failed, a peripheral did not respond");
-        return false;
-    }
-
-    for (int y = y_start; y < y_end; y++) {
-        if (engine.row_dirty[y]) {
-            memcpy(engine.back + y * T5S3_EPD_FB_ROW_BYTES, engine.front + y * T5S3_EPD_FB_ROW_BYTES, T5S3_EPD_FB_ROW_BYTES);
+        for (int y = changed->y0; y < changed->y1; y++) {
+            if (engine->row_dirty[y]) {
+                memcpy(engine->back + y * T5S3_EPD_FB_ROW_BYTES, engine->fast + y * T5S3_EPD_FB_ROW_BYTES, T5S3_EPD_FB_ROW_BYTES);
+            }
         }
     }
 
-    const int elapsed_ms = static_cast<int>((esp_timer_get_time() - started) / 1000);
-    // Quality and slow updates are logged at info level, frequent fast updates would flood the log
-    if (mode != T5s3EpdMode::Fast || elapsed_ms > 150) {
-        LOG_I(TAG, "Updated rows %d to %d in %d ms", static_cast<int>(y_start), static_cast<int>(y_end), elapsed_ms);
-    } else {
-        LOG_D(TAG, "Updated rows %d to %d in %d ms", static_cast<int>(y_start), static_cast<int>(y_end), elapsed_ms);
-    }
+    LOG_D(TAG, "Fast update of %dx%d at %d,%d took %d ms", static_cast<int>(changed->x1 - changed->x0), static_cast<int>(changed->y1 - changed->y0),
+        static_cast<int>(changed->x0), static_cast<int>(changed->y0), static_cast<int>((esp_timer_get_time() - started) / 1000));
     return true;
 }
 
-static void draw_clear_frames(uint8_t pattern, int count) {
-    for (int i = 0; i < count && !engine.failed; i++) {
-        draw_uniform_frame(pattern, CLEAR_HOLD_TICKS);
+// Drives only the columns of the areas that cover the row
+static void IRAM_ATTR prepare_refresh_row(int y, uint8_t* out, void*) {
+    memset(engine->line_mask, 0, sizeof(engine->line_mask));
+    for (int i = 0; i < engine->rect_count; i++) {
+        const T5s3EpdRect& rect = engine->rects[i];
+        if (y >= rect.y0 && y < rect.y1) {
+            // A mask byte covers 4 pixels
+            memset(engine->line_mask + rect.x0 / 4, 0xFF, (rect.x1 + 3) / 4 - rect.x0 / 4);
+        }
+    }
+    prepare_row(y, out, nullptr);
+}
+
+static inline bool needs_refresh(int y, int x) {
+    const uint8_t front = engine->front[y * T5S3_EPD_FB_ROW_BYTES + x / 2];
+    const uint8_t back = engine->back[y * T5S3_EPD_FB_ROW_BYTES + x / 2];
+    const int shift = (x & 1) * 4;
+    const bool differs = ((front ^ back) >> shift & 0x0F) != 0;
+    return differs || (engine->touched[y * TOUCHED_ROW_BYTES + x / 8] >> (x & 7) & 1) != 0;
+}
+
+// Bus rows of the settle frames during and after the shake, kept in the buffer of the fast update, which a refresh
+// does not use. A row of that buffer holds both.
+static inline uint8_t* settle_row(int y, bool shaking) {
+    return engine->fast + y * T5S3_EPD_FB_ROW_BYTES + (shaking ? 0 : T5S3_EPD_BUS_ROW_BYTES);
+}
+
+static void build_settle_rows(int y) {
+    uint8_t* shake = settle_row(y, true);
+    uint8_t* after = settle_row(y, false);
+    memset(shake, 0, T5S3_EPD_BUS_ROW_BYTES);
+    memset(after, 0, T5S3_EPD_BUS_ROW_BYTES);
+    for (int i = 0; i < engine->rect_count; i++) {
+        const T5s3EpdRect& rect = engine->rects[i];
+        if (y < rect.y0 || y >= rect.y1) {
+            continue;
+        }
+        for (int x = rect.x0 / 4 * 4; x < (rect.x1 + 3) / 4 * 4; x++) {
+            if (!needs_refresh(y, x)) {
+                continue;
+            }
+            const uint8_t level = engine->front[y * T5S3_EPD_FB_ROW_BYTES + x / 2] >> ((x & 1) * 4) & 0x0F;
+            const int shift = (x & 3) * 2;
+            const uint8_t shake_action = level == 15 ? T5S3_EPD_ACTION_LIGHT : T5S3_EPD_ACTION_DARK;
+            const uint8_t after_action = level == 0 ? T5S3_EPD_ACTION_DARK : T5S3_EPD_ACTION_LIGHT;
+            shake[x / 4] |= static_cast<uint8_t>(shake_action << shift);
+            after[x / 4] |= static_cast<uint8_t>(after_action << shift);
+        }
+    }
+}
+
+static void IRAM_ATTR prepare_settle_row(int y, uint8_t* out, void*) {
+    memcpy(out, settle_row(y, engine->settle_frame < REFRESH_SHAKE_FRAMES), T5S3_EPD_BUS_ROW_BYTES);
+}
+
+bool t5s3_epd_refresh(const T5s3EpdRect* rects, int count) {
+    const int64_t started = esp_timer_get_time();
+    // Only rows with pixels that need a refresh are sent
+    int y_start = T5S3_EPD_HEIGHT;
+    int y_end = 0;
+    for (int i = 0; i < count; i++) {
+        const T5s3EpdRect& rect = rects[i];
+        for (int y = rect.y0; y < rect.y1; y++) {
+            bool needed = false;
+            for (int x = rect.x0; x < rect.x1 && !needed; x++) {
+                needed = needs_refresh(y, x);
+            }
+            if (needed) {
+                y_start = y < y_start ? y : y_start;
+                y_end = y + 1 > y_end ? y + 1 : y_end;
+            }
+        }
+    }
+    if (y_start >= y_end) {
+        return true;
+    }
+
+    engine->rects = rects;
+    engine->rect_count = count;
+    for (int y = y_start; y < y_end; y++) {
+        build_settle_rows(y);
+    }
+    bool success = true;
+    for (int frame = 0; frame < REFRESH_SETTLE_FRAMES && success; frame++) {
+        engine->settle_frame = frame;
+        const int64_t frame_start_us = esp_timer_get_time();
+        success = t5s3_epd_board_frame(y_start, y_end, nullptr, FAST_HOLD_TICKS, prepare_settle_row, nullptr);
+        pad_frame(frame_start_us, FAST_FRAME_US);
+    }
+
+    // Gray pixels are white now, black and white pixels show their level. The waveform starts from the white that its
+    // gray levels were measured from.
+    for (int i = 0; i < count && success; i++) {
+        const T5s3EpdRect& rect = rects[i];
+        for (int y = rect.y0; y < rect.y1; y++) {
+            for (int x = rect.x0 / 4 * 4; x < (rect.x1 + 3) / 4 * 4; x++) {
+                if (!needs_refresh(y, x)) {
+                    continue;
+                }
+                uint8_t* byte = &engine->back[y * T5S3_EPD_FB_ROW_BYTES + x / 2];
+                const int shift = (x & 1) * 4;
+                const uint8_t level = engine->front[y * T5S3_EPD_FB_ROW_BYTES + x / 2] >> shift & 0x0F;
+                const uint8_t shown = level == 0 ? 0 : 15;
+                *byte = static_cast<uint8_t>((*byte & ~(0x0F << shift)) | (shown << shift));
+                engine->touched[y * TOUCHED_ROW_BYTES + x / 8] &= static_cast<uint8_t>(~(1 << (x & 7)));
+            }
+        }
+    }
+
+    engine->to = engine->front;
+    for (int phase = 0; phase < T5S3_EPD_QUALITY_PHASES && success; phase++) {
+        t5s3_epd_build_quality_table(engine->table, phase);
+        const int64_t frame_start_us = esp_timer_get_time();
+        success = t5s3_epd_board_frame(y_start, y_end, nullptr, T5S3_EPD_QUALITY_HOLD[phase], prepare_refresh_row, nullptr);
+        pad_frame(frame_start_us, QUALITY_FRAME_US);
+    }
+    if (!success) {
+        LOG_E(TAG, "Refresh failed, a peripheral did not respond");
+        return false;
+    }
+
+    // The mask covers groups of 4 pixels, so whole groups were driven
+    for (int i = 0; i < count; i++) {
+        const T5s3EpdRect& rect = rects[i];
+        const int x0 = rect.x0 / 4 * 2;
+        const int x1 = (rect.x1 + 3) / 4 * 2;
+        for (int y = rect.y0; y < rect.y1; y++) {
+            const size_t offset = y * T5S3_EPD_FB_ROW_BYTES + x0;
+            memcpy(engine->back + offset, engine->front + offset, x1 - x0);
+        }
+    }
+
+    LOG_D(TAG, "Refresh of %d areas in rows %d to %d took %d ms", count, y_start, y_end, static_cast<int>((esp_timer_get_time() - started) / 1000));
+    return true;
+}
+
+static bool draw_clear_frames(uint8_t pattern, int count) {
+    t5s3_epd_board_fill_rows(pattern);
+    bool success = true;
+    for (int i = 0; i < count && success; i++) {
+        success = t5s3_epd_board_frame(0, T5S3_EPD_HEIGHT, nullptr, CLEAR_HOLD_TICKS, nullptr, nullptr);
         vTaskDelay(1);
     }
+    return success;
 }
 
 bool t5s3_epd_clear() {
     const int64_t started = esp_timer_get_time();
     t5s3_epd_fill_white();
-    if (!t5s3_epd_update(T5s3EpdMode::Full, 0, T5S3_EPD_HEIGHT)) {
+    const T5s3EpdRect panel = { 0, 0, T5S3_EPD_WIDTH, T5S3_EPD_HEIGHT };
+    if (!t5s3_epd_refresh(&panel, 1)) {
         return false;
     }
-    engine.failed = false;
-    for (int cycle = 0; cycle < CLEAR_CYCLES; cycle++) {
-        draw_clear_frames(ALL_DARK, CLEAR_DARK_FRAMES);
-        draw_clear_frames(ALL_LIGHT, CLEAR_LIGHT_FRAMES);
-        draw_clear_frames(0, CLEAR_REST_FRAMES);
+    bool success = true;
+    for (int cycle = 0; cycle < CLEAR_CYCLES && success; cycle++) {
+        success = draw_clear_frames(T5S3_EPD_ALL_DARK, CLEAR_DARK_FRAMES) &&
+            draw_clear_frames(T5S3_EPD_ALL_LIGHT, CLEAR_LIGHT_FRAMES) &&
+            draw_clear_frames(0, CLEAR_REST_FRAMES);
     }
-    if (engine.failed) {
+    if (!success) {
         LOG_E(TAG, "Clear failed, a peripheral did not respond");
         return false;
     }
     LOG_I(TAG, "Cleared in %d ms", static_cast<int>((esp_timer_get_time() - started) / 1000));
     return true;
 }
-
-// endregion

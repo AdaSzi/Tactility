@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "t5s3_epd_board.h"
 #include "t5s3_epd_waveform.h"
 
 #include <cstdint>
@@ -16,15 +17,9 @@
 #define T5S3_EPD_IRAM
 #endif
 
-constexpr int T5S3_EPD_WIDTH = 960;
-constexpr int T5S3_EPD_HEIGHT = 540;
-
 // Framebuffer rows hold 4 bits per pixel with the even pixel of a pair in the low nibble, 0x0 is black and 0xF is white
 constexpr int T5S3_EPD_FB_ROW_BYTES = T5S3_EPD_WIDTH / 2;
 constexpr int T5S3_EPD_FB_BYTES = T5S3_EPD_FB_ROW_BYTES * T5S3_EPD_HEIGHT;
-
-// Rows on the bus hold 2 bits per pixel with the first of four pixels in the lowest bits
-constexpr int T5S3_EPD_BUS_ROW_BYTES = T5S3_EPD_WIDTH / 4;
 
 constexpr uint8_t T5S3_EPD_ACTION_HOLD = 0;
 constexpr uint8_t T5S3_EPD_ACTION_DARK = 1;
@@ -32,14 +27,14 @@ constexpr uint8_t T5S3_EPD_ACTION_LIGHT = 2;
 
 // Tables map (target level << 4 | source level) to the action for one phase of an update.
 
-// Fast update: pixels that end up black are driven dark and pixels that end up white are driven light
+// Fast update: changed pixels with a black target are driven dark and changed pixels with a white target light.
 inline void t5s3_epd_build_fast_table(uint8_t* table) {
     for (int to = 0; to < 16; to++) {
         for (int from = 0; from < 16; from++) {
             uint8_t action = T5S3_EPD_ACTION_HOLD;
-            if (to == 0 && from != 0) {
+            if (to != from && to == 0) {
                 action = T5S3_EPD_ACTION_DARK;
-            } else if (to == 15 && from != 15) {
+            } else if (to != from && to == 15) {
                 action = T5S3_EPD_ACTION_LIGHT;
             }
             table[(to << 4) | from] = action;
@@ -47,9 +42,8 @@ inline void t5s3_epd_build_fast_table(uint8_t* table) {
     }
 }
 
-// The waveform drives white pixels that stay white with a dark and a light pulse, which flashes them.
-// Holding them instead leaves the rest of an area alone, so an update of a part of the screen does not leave visible columns.
-inline void t5s3_epd_build_quality_table(uint8_t* table, int phase, bool flash_white) {
+// Pixels that keep their level are held, so a refresh only drives the pixels that need it
+inline void t5s3_epd_build_quality_table(uint8_t* table, int phase) {
     const uint8_t* packed = T5S3_EPD_QUALITY_LUT[phase];
     for (int to = 0; to < 16; to++) {
         for (int group = 0; group < 4; group++) {
@@ -61,8 +55,8 @@ inline void t5s3_epd_build_quality_table(uint8_t* table, int phase, bool flash_w
             table[index + 3] = actions & 3;
         }
     }
-    if (!flash_white) {
-        table[(15 << 4) | 15] = T5S3_EPD_ACTION_HOLD;
+    for (int level = 0; level < 16; level++) {
+        table[(level << 4) | level] = T5S3_EPD_ACTION_HOLD;
     }
 }
 
