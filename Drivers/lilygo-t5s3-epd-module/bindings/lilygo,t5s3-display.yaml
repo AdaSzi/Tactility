@@ -1,5 +1,5 @@
 description: >
-  LILYGO T5 4.7 Inch E-Paper S3 (V2.3/V2.4) display with an ED047TC1 panel, driven in 7 shades with a dose of
+  LILYGO T5 4.7 Inch E-Paper S3 (V2.3/V2.4) display with an ED047TC1 panel, driven in 16 shades with a dose of
   frames per pixel instead of waveform tables. Updates do not block and leave no trails on gray backgrounds.
   The pins of the panel are fixed in the driver, so this node only has the pixel clock as property.
 

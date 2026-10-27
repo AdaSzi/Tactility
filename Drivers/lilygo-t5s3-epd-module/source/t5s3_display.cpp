@@ -27,9 +27,9 @@
 // Gray levels are drawn without waveform tables, with a dose of frames per pixel in the manner of InkBoy
 // (https://github.com/kuslota/InkBoy). A pixel whose target shade changes gets a program: black is driven dark for
 // BLACK_FRAMES frames. White and the grays are driven light for LIGHT_FRAMES frames, which erases what the pixel showed
-// before. The grays then rest for HOLD_FRAMES frames and are driven dark for the dose of their shade. A gray then looks
-// the same whatever the pixel came from and moving content leaves no trails. Pixels whose target does not change are
-// never driven.
+// before. The grays then rest for a few frames and are driven dark for the dose of their shade. A gray then looks the
+// same whatever the pixel came from and moving content leaves no trails. Pixels whose target does not change are never
+// driven.
 //
 // Every frame covers the rows from the top down to the lowest row of the current updates, so all of them change at once.
 // The helper task encodes the next frame while the display task sends the current one.
@@ -48,18 +48,19 @@ static constexpr int CHUNK_PIXELS = 32;
 static constexpr int CHUNKS = PANEL_WIDTH / CHUNK_PIXELS;
 static_assert(CHUNKS <= 32);
 
-// Shades from black to white. The dose of a gray is its number of dark frames after the light frames.
+// Shades from black to white. The dose of a gray is its number of dark frames after the light frames and the frames of
+// rest before them. Each frame of rest makes the dose a little darker, which gives shades between those of whole frames.
 // The brightness of each shade was measured with a camera, 0 is black and 255 is white.
-static constexpr int SHADES = 7;
+static constexpr int SHADES = 16;
 static constexpr uint8_t SHADE_BLACK = 0;
 static constexpr uint8_t SHADE_WHITE = SHADES - 1;
-static constexpr uint8_t SHADE_DOSE[SHADES] = { 0, 6, 4, 3, 2, 1, 0 };
-static constexpr uint8_t SHADE_BRIGHTNESS[SHADES] = { 0, 28, 54, 94, 145, 199, 255 };
+static constexpr uint8_t SHADE_DOSE[SHADES] = { 0, 8, 6, 5, 5, 4, 4, 3, 3, 3, 2, 2, 2, 1, 1, 0 };
+static constexpr uint8_t SHADE_REST[SHADES] = { 0, 0, 1, 2, 0, 1, 0, 2, 1, 0, 3, 1, 0, 3, 0, 0 };
+static constexpr uint8_t SHADE_BRIGHTNESS[SHADES] = { 0, 21, 35, 47, 59, 70, 82, 94, 106, 120, 135, 155, 173, 196, 223, 255 };
 
 // Between 10 and 30 light frames the grays come out the same whatever the pixel showed before, fewer leave traces
 static constexpr uint8_t LIGHT_FRAMES = 15;
 static constexpr uint8_t BLACK_FRAMES = 12;
-static constexpr uint8_t HOLD_FRAMES = 1;
 
 // A program byte is 0 for a pixel at rest, the dark frames left below HOLD_BASE, HOLD_BASE plus the frames of rest left
 // below LIGHT_BASE and LIGHT_BASE plus the light frames left above. Rest and the dark frames of the goal follow the light frames.
@@ -272,7 +273,8 @@ static bool step_chunk(T5s3DisplayInternal* internal, int y, int chunk, uint8_t*
                 const int x = word * 4 + i;
                 uint32_t next = frames;
                 if (frames == LIGHT_BASE) {
-                    next = SHADE_DOSE[get_nibble(goal, x)] == 0 ? 0 : HOLD_BASE + HOLD_FRAMES;
+                    const uint8_t shade = get_nibble(goal, x);
+                    next = SHADE_REST[shade] != 0 ? HOLD_BASE + SHADE_REST[shade] : SHADE_DOSE[shade];
                 } else if (frames == HOLD_BASE) {
                     next = SHADE_DOSE[get_nibble(goal, x)];
                 }
@@ -657,7 +659,7 @@ static error_t t5s3_display_refresh(Device* device) {
     return ERROR_NONE;
 }
 
-// Reports GRAYSCALE8 so that draw_bitmap() is called per changed tile. The luminance is dithered between the shades.
+// Reports GRAYSCALE8 so that draw_bitmap() is called per changed tile. The luminance is dithered between the two nearest shades.
 static error_t t5s3_display_draw_bitmap(Device* device, int32_t x_start, int32_t y_start, int32_t x_end, int32_t y_end, const void* color_data) {
     auto* internal = static_cast<T5s3DisplayInternal*>(device_get_driver_data(device));
     const int64_t start_us = esp_timer_get_time();
