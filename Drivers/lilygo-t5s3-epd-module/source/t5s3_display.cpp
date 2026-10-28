@@ -60,7 +60,9 @@ static constexpr uint8_t SHADE_BRIGHTNESS[SHADES] = { 0, 21, 35, 47, 59, 70, 82,
 
 // Between 10 and 30 light frames the grays come out the same whatever the pixel showed before, fewer leave traces
 static constexpr uint8_t LIGHT_FRAMES = 15;
-static constexpr uint8_t BLACK_FRAMES = 12;
+// Black is driven until grays that started with it ended their light frames. Pixels driven light wash out a thin black
+// line next to them, for example a line of 1 pixel on a gray area that is drawn again after a refresh.
+static constexpr uint8_t BLACK_FRAMES = LIGHT_FRAMES + 3;
 
 // A program byte is 0 for a pixel at rest, the dark frames left below HOLD_BASE, HOLD_BASE plus the frames of rest left
 // below LIGHT_BASE and LIGHT_BASE plus the light frames left above. Rest and the dark frames of the goal follow the light frames.
@@ -404,6 +406,11 @@ static Encoded finish_helper(T5s3DisplayInternal* internal) {
 
 // Encodes a whole frame on both cores without a budget
 static Encoded encode_now(T5s3DisplayInternal* internal, uint8_t* bus) {
+    // restart_doses() covers all rows, so it must not run on the helper while this task encodes the upper half
+    if (internal->restart) {
+        internal->restart = false;
+        restart_doses(internal);
+    }
     start_helper(internal, bus, PANEL_HEIGHT / 2, PANEL_HEIGHT, -1);
     EncodeJob job = { bus, 0, PANEL_HEIGHT / 2, -1, { false, 0 }, 0 };
     encode(internal, &job);
