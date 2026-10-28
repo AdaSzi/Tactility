@@ -595,12 +595,13 @@ static void display_task(void* arg) {
         longest_frame_us = std::max(longest_frame_us, frame_us);
         next_frame_us = frame_start_us + FRAME_PERIOD_US;
         frames++;
-        // A late or stalled frame drives some pixels for longer than their dose
+        const Encoded next = finish_helper(internal);
+        // A late or stalled frame drives some pixels for longer than their dose. The flag is set while the helper is
+        // idle, it restarts the doses with its next job.
         if (late_us > (encoding_late ? ENCODING_STALL_US : STALL_US) || frame_us > FRAME_PERIOD_US + STALL_US) {
             internal->restart = true;
             LOG_W(TAG, "Frame %d us late and %d us long, doses start again", static_cast<int>(late_us), static_cast<int>(frame_us));
         }
-        const Encoded next = finish_helper(internal);
         encoding_late = esp_timer_get_time() > next_frame_us;
         longest_encode_us = std::max(longest_encode_us, internal->helper_job.duration_us);
 
